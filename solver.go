@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/scrypt"
+	"golang.org/x/net/publicsuffix"
 )
 
 type CryptoConfig struct {
@@ -31,6 +32,7 @@ type CryptoConfig struct {
 	Identifier    string
 	TypeNames     map[string]string
 	SignalVersion string
+	Material      []uint32
 }
 
 type AWSWAFSession struct {
@@ -48,6 +50,7 @@ type AWSWAFSession struct {
 	WAFToken           string
 	SessionStorage     string
 	Crypto             *CryptoConfig
+	Fingerprint        map[string]interface{}
 }
 
 type TelemetryResponse struct {
@@ -82,7 +85,7 @@ func NewAWSWAFSession(targetURL string, proxy string, proxies []string) *AWSWAFS
 		{1440, 900}, {1680, 1050}, {1280, 720}, {1600, 900},
 	}
 	scr := screens[mrand.Intn(len(screens))]
-	chromeMajor := []string{"131", "132", "133"}[mrand.Intn(3)]
+	chromeMajor := "131"
 	chromeVer := chromeMajor + ".0.0.0"
 
 	return &AWSWAFSession{
@@ -96,6 +99,23 @@ func NewAWSWAFSession(targetURL string, proxy string, proxies []string) *AWSWAFS
 		ScreenW:       scr[0],
 		ScreenH:       scr[1],
 	}
+}
+
+func cloneMap(in map[string]interface{}) map[string]interface{} {
+	b, _ := json.Marshal(in)
+	var out map[string]interface{}
+	_ = json.Unmarshal(b, &out)
+	return out
+}
+
+func (s *AWSWAFSession) buildSignals() map[string]interface{} {
+	if s.Fingerprint != nil {
+		return cloneMap(s.Fingerprint)
+	}
+
+	signals := s.buildSignalsFresh()
+	s.Fingerprint = cloneMap(signals)
+	return signals
 }
 
 func (s *AWSWAFSession) browserHeaders() map[string]string {
@@ -141,6 +161,31 @@ func (s *AWSWAFSession) challengeHeaders() map[string]string {
 	}
 }
 
+func validateChallengeInputs(ci *ChallengeInputs) error {
+	if ci == nil {
+		return fmt.Errorf("challenge inputs are nil")
+	}
+	if ci.Challenge.Input == "" {
+		return fmt.Errorf("missing challenge.input")
+	}
+	if ci.Challenge.Hmac == "" {
+		return fmt.Errorf("missing challenge.hmac")
+	}
+	if ci.Challenge.Region == "" {
+		return fmt.Errorf("missing challenge.region")
+	}
+	if ci.ChallengeType == "" {
+		return fmt.Errorf("missing challenge_type")
+	}
+	if ci.Difficulty == 0 {
+		return fmt.Errorf("missing difficulty")
+	}
+	if ci.Memory == 0 {
+		return fmt.Errorf("missing memory")
+	}
+	return nil
+}
+
 func (s *AWSWAFSession) Solve() bool {
 	logPhase("fetching target page")
 	logInfo("url     :: %s", s.TargetURL)
@@ -183,8 +228,8 @@ func (s *AWSWAFSession) Solve() bool {
 	s.Crypto = cryptoConfig
 
 	challengeInputs := s.extractChallengeInputs(challengeScript)
-	if challengeInputs == nil {
-		logFail("could not extract challenge inputs from script")
+	if err := validateChallengeInputs(challengeInputs); err != nil {
+		logFail("invalid challenge inputs :: %v", err)
 		return false
 	}
 	logSuccess("challenge :: type=%s diff=%d mem=%d",
@@ -197,7 +242,7 @@ func (s *AWSWAFSession) Solve() bool {
 		return false
 	}
 
-	return s.processResponse(resp, challengeInputs)
+	return s.processResponseLoop(resp, challengeInputs, 5)
 }
 
 func (s *AWSWAFSession) challengeTypeName(hash string) string {
@@ -238,6 +283,9 @@ func (s *AWSWAFSession) solveAndPost(ci *ChallengeInputs) (*TelemetryResponse, e
 	logSuccess("solved  :: %v  %s", solveTime, truncate(solution, 80))
 
 	existingToken := s.Jar.GetValue(s.Domain, "aws-waf-token")
+	if existingToken == "" {
+		existingToken = s.WAFToken
+	}
 
 	cookieStart := time.Now()
 	_ = existingToken
@@ -326,60 +374,80 @@ func (s *AWSWAFSession) solveAndPost(ci *ChallengeInputs) (*TelemetryResponse, e
 	return &telResp, nil
 }
 
-func (s *AWSWAFSession) processResponse(resp *TelemetryResponse, inputs *ChallengeInputs) bool {
-	if resp.Token != "" {
-		logSuccess("token received directly")
-		s.setWAFToken(resp.Token)
-		return true
-	}
+func (s *AWSWAFSession) processResponseLoop(resp *TelemetryResponse, inputs *ChallengeInputs, maxSteps int) bool {
+	currentResp := resp
+	currentInputs := inputs
 
-	if resp.Response != nil {
-		if resp.Response.Token != "" {
-			logSuccess("token received from response")
-			s.setWAFToken(resp.Response.Token)
+	for step := 0; step < maxSteps; step++ {
+		if currentResp.Token != "" {
+			logSuccess("token received directly")
+			s.setWAFToken(currentResp.Token)
 			return true
 		}
-		if resp.Response.AWSWAFSessionStore != "" {
-			s.SessionStorage = resp.Response.AWSWAFSessionStore
+
+		if currentResp.Response != nil {
+			if currentResp.Response.Token != "" {
+				logSuccess("token received from response")
+				s.setWAFToken(currentResp.Response.Token)
+				return true
+			}
+
+			if currentResp.Response.AWSWAFSessionStore != "" {
+				s.SessionStorage = currentResp.Response.AWSWAFSessionStore
+			}
+
+			if currentResp.Response.Inputs != nil {
+				var next ChallengeInputs
+				if err := json.Unmarshal(currentResp.Response.Inputs, &next); err != nil {
+					logFail("parse nested inputs :: %v", err)
+					return false
+				}
+				if next.Memory == 0 && currentInputs != nil {
+					next.Memory = currentInputs.Memory
+				}
+				if err := validateChallengeInputs(&next); err != nil {
+					logFail("invalid nested inputs :: %v", err)
+					return false
+				}
+				nextResp, err := s.solveAndPost(&next)
+				if err != nil {
+					logFail("retry step %d :: %v", step+1, err)
+					return false
+				}
+				currentInputs = &next
+				currentResp = nextResp
+				continue
+			}
 		}
-		if resp.Response.Inputs != nil {
-			logWarn("server sent new challenge inputs, retrying")
-			var newCI ChallengeInputs
-			if err := json.Unmarshal(resp.Response.Inputs, &newCI); err != nil {
-				logFail("parse new inputs :: %v", err)
+
+		if currentResp.Inputs != nil {
+			var next ChallengeInputs
+			if err := json.Unmarshal(currentResp.Inputs, &next); err != nil {
+				logFail("parse inputs :: %v", err)
 				return false
 			}
-			if newCI.Memory == 0 && inputs != nil {
-				newCI.Memory = inputs.Memory
+			if next.Memory == 0 && currentInputs != nil {
+				next.Memory = currentInputs.Memory
 			}
-			retryResp, err := s.solveAndPost(&newCI)
+			if err := validateChallengeInputs(&next); err != nil {
+				logFail("invalid response inputs :: %v", err)
+				return false
+			}
+			nextResp, err := s.solveAndPost(&next)
 			if err != nil {
-				logFail("retry :: %v", err)
+				logFail("retry step %d :: %v", step+1, err)
 				return false
 			}
-			return s.processResponse(retryResp, inputs)
+			currentInputs = &next
+			currentResp = nextResp
+			continue
 		}
+
+		logFail("no token and no challenge in response")
+		return false
 	}
 
-	if resp.Inputs != nil {
-		logWarn("got challenge inputs in response, solving")
-		var ci ChallengeInputs
-		if err := json.Unmarshal(resp.Inputs, &ci); err != nil {
-			logFail("parse inputs :: %v", err)
-			return false
-		}
-		if ci.Memory == 0 && inputs != nil {
-			ci.Memory = inputs.Memory
-		}
-		retryResp, err := s.solveAndPost(&ci)
-		if err != nil {
-			logFail("retry :: %v", err)
-			return false
-		}
-		return s.processResponse(retryResp, inputs)
-	}
-
-	logFail("no token and no challenge in response")
+	logFail("too many response-processing steps")
 	return false
 }
 
@@ -443,7 +511,13 @@ func (s *AWSWAFSession) extractCryptoConfig(challengeScript string) (*CryptoConf
 		return nil, fmt.Errorf("extract_config.js not found")
 	}
 
-	cmd := exec.Command("node", extractScript, tmpPath)
+	path, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	node := filepath.Join(filepath.Dir(path), "bin/node")
+
+	cmd := exec.Command(node, extractScript, tmpPath)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -457,6 +531,7 @@ func (s *AWSWAFSession) extractCryptoConfig(challengeScript string) (*CryptoConf
 		Identifier    string            `json:"identifier"`
 		TypeNames     map[string]string `json:"typeNames"`
 		SignalVersion string            `json:"signalVersion"`
+		Material      []uint32          `json:"material"`
 		Error         string            `json:"error"`
 	}
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
@@ -490,6 +565,10 @@ func (s *AWSWAFSession) extractCryptoConfig(challengeScript string) (*CryptoConf
 	if config.SignalVersion == "" {
 		config.SignalVersion = "2.4.0"
 	}
+
+	config.Material = result.Material
+	logSuccess("crypto  :: id=%s key=%dB ver=%s types=%d material=%v",
+		config.Identifier, len(config.Key), config.SignalVersion, len(config.TypeNames), config.Material)
 
 	logSuccess("crypto  :: id=%s key=%dB ver=%s types=%d",
 		config.Identifier, len(config.Key), config.SignalVersion, len(config.TypeNames))
@@ -570,7 +649,7 @@ func (s *AWSWAFSession) extractChallengeInputs(script string) *ChallengeInputs {
 		fmt.Sscanf(m[2], "%d", &memory)
 	}
 
-	typeRe := regexp.MustCompile(`'(ha[0-9a-f]{60,})'`)
+	typeRe := regexp.MustCompile(`['"]((?:ha9faaffd|h72f957df|h7b0c470f)[0-9a-f]{40,})['"]`)
 	challengeType := ""
 	if m := typeRe.FindStringSubmatch(script); m != nil {
 		challengeType = m[1]
@@ -646,7 +725,7 @@ func (s *AWSWAFSession) extractChallengeInputs(script string) *ChallengeInputs {
 	}
 }
 
-func (s *AWSWAFSession) buildSignals() map[string]interface{} {
+func (s *AWSWAFSession) buildSignalsFresh() map[string]interface{} {
 	now := time.Now()
 	startTime := now.Add(-time.Duration(mrand.Intn(200)+100) * time.Millisecond)
 	hardwareConcurrency := []int{4, 8, 12, 16}[mrand.Intn(4)]
@@ -669,24 +748,24 @@ func (s *AWSWAFSession) buildSignals() map[string]interface{} {
 	signals := map[string]interface{}{
 		"version": sigVersion,
 		"navigator": map[string]interface{}{
-			"userAgent":            s.UserAgent,
-			"appCodeName":          "Mozilla",
-			"appName":              "Netscape",
-			"appVersion":           strings.TrimPrefix(s.UserAgent, "Mozilla/"),
-			"language":             "en-US",
-			"languages":            []string{"en-US", "en"},
-			"platform":             "Win32",
-			"product":              "Gecko",
-			"productSub":           "20030107",
-			"vendor":               "Google Inc.",
-			"vendorSub":            "",
-			"hardwareConcurrency":  hardwareConcurrency,
-			"maxTouchPoints":       0,
-			"cookieEnabled":        true,
-			"onLine":               true,
-			"deviceMemory":         deviceMemory,
-			"pdfViewerEnabled":     true,
-			"webdriver":            false,
+			"userAgent":           s.UserAgent,
+			"appCodeName":         "Mozilla",
+			"appName":             "Netscape",
+			"appVersion":          strings.TrimPrefix(s.UserAgent, "Mozilla/"),
+			"language":            "en-US",
+			"languages":           []string{"en-US", "en"},
+			"platform":            "Win32",
+			"product":             "Gecko",
+			"productSub":          "20030107",
+			"vendor":              "Google Inc.",
+			"vendorSub":           "",
+			"hardwareConcurrency": hardwareConcurrency,
+			"maxTouchPoints":      0,
+			"cookieEnabled":       true,
+			"onLine":              true,
+			"deviceMemory":        deviceMemory,
+			"pdfViewerEnabled":    true,
+			"webdriver":           false,
 		},
 		"screen": map[string]interface{}{
 			"width":       s.ScreenW,
@@ -833,6 +912,9 @@ func (s *AWSWAFSession) sendTelemetryRefresh() (*TelemetryResponse, error) {
 	}
 
 	existingToken := s.Jar.GetValue(s.Domain, "aws-waf-token")
+	if existingToken == "" {
+		existingToken = s.WAFToken
+	}
 
 	metrics := []map[string]interface{}{
 		{"name": "TelemetryFormCycleBufferClearedCount", "value": 0, "unit": "Count"},
@@ -1017,10 +1099,10 @@ func (s *AWSWAFSession) setWAFToken(token string) {
 	s.WAFToken = token
 	s.Jar.Set(s.Domain, "aws-waf-token", token)
 
-	parts := strings.Split(s.Domain, ".")
-	if len(parts) > 2 {
-		parentDomain := strings.Join(parts[len(parts)-2:], ".")
-		s.Jar.Set(parentDomain, "aws-waf-token", token)
+	if u, err := url.Parse("https://" + s.Domain); err == nil {
+		if etld1, err := publicsuffix.EffectiveTLDPlusOne(u.Hostname()); err == nil {
+			s.Jar.Set(etld1, "aws-waf-token", token)
+		}
 	}
 
 	logSuccess("token   :: %s", truncate(token, 80))
@@ -1037,6 +1119,9 @@ func (s *AWSWAFSession) VerifyToken() bool {
 		}
 	}
 
+	logInfo("verify cookie header=%q", headers["Cookie"])
+	logInfo("verify token prefix=%s", truncate(s.WAFToken, 80))
+
 	resp, err := DoRequestFollowRedirects(s.TargetURL, RequestOpts{
 		Method:  "GET",
 		Headers: headers,
@@ -1048,6 +1133,9 @@ func (s *AWSWAFSession) VerifyToken() bool {
 		return false
 	}
 
+	logInfo("verify  :: final url=%s", resp.FinalURL)
+	logInfo("verify  :: set-cookie=%v", resp.Headers.Values("Set-Cookie"))
+	logInfo("verify  :: content-type=%s", resp.Headers.Get("Content-Type"))
 	logInfo("verify  :: status=%d size=%d", resp.Status, len(resp.Body))
 
 	body := string(resp.Body)
@@ -1060,6 +1148,8 @@ func (s *AWSWAFSession) VerifyToken() bool {
 		logFail("token rejected (status %d)", resp.Status)
 		return false
 	}
+
+	logFail("verify  :: body preview=%q", truncate(string(body), 700))
 
 	return resp.Status == 200
 }

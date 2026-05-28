@@ -23,9 +23,10 @@ import (
 )
 
 type HttpResponse struct {
-	Status  int
-	Headers http.Header
-	Body    []byte
+	Status   int
+	Headers  http.Header
+	Body     []byte
+	FinalURL string
 }
 
 type RequestOpts struct {
@@ -103,6 +104,76 @@ func (j *CookieJar) ParseSetCookie(domain string, headers http.Header) {
 			j.Set(domain, nv[:eq], nv[eq+1:])
 		}
 	}
+}
+
+func parseCookieHeader(header string) map[string]string {
+	out := make(map[string]string)
+	for _, part := range strings.Split(header, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		eq := strings.IndexByte(part, '=')
+		if eq <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(part[:eq])
+		value := strings.TrimSpace(part[eq+1:])
+		if name != "" {
+			out[name] = value
+		}
+	}
+	return out
+}
+
+func formatCookies(cookies map[string]string) string {
+	if len(cookies) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(cookies))
+	for k, v := range cookies {
+		if k != "" && v != "" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+cookies[k])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func mergeCookieHeaders(left, right string) string {
+	merged := parseCookieHeader(left)
+	for k, v := range parseCookieHeader(right) {
+		// Values from right win. This lets explicit per-domain jar cookies refresh stale header cookies.
+		merged[k] = v
+	}
+	return formatCookies(merged)
+}
+
+func seedJarFromCookieHeader(jar *CookieJar, domain, cookieHeader string) {
+	if jar == nil || domain == "" || cookieHeader == "" {
+		return
+	}
+	for k, v := range parseCookieHeader(cookieHeader) {
+		jar.Set(domain, k, v)
+	}
+}
+
+func applyJarCookies(opts *RequestOpts, jar *CookieJar, domain string) {
+	if opts.Headers == nil {
+		opts.Headers = make(map[string]string)
+	}
+	if jar == nil || domain == "" {
+		return
+	}
+	jarCookies := jar.Get(domain)
+	if jarCookies == "" {
+		return
+	}
+	opts.Headers["Cookie"] = mergeCookieHeaders(opts.Headers["Cookie"], jarCookies)
 }
 
 var chromeHeaderPriority = map[string]int{
@@ -288,35 +359,53 @@ func DoRequest(rawURL string, opts RequestOpts) (*HttpResponse, error) {
 }
 
 func DoRequestFollowRedirects(rawURL string, opts RequestOpts, jar *CookieJar) (*HttpResponse, error) {
+	if opts.Headers == nil {
+		opts.Headers = make(map[string]string)
+	}
+
 	for i := 0; i < 10; i++ {
+		domain := extractHost(rawURL)
+
+		// Keep manually supplied Cookie values, but also seed the custom jar from them.
+		// This prevents cookies such as aws-waf-token from disappearing after redirects.
+		seedJarFromCookieHeader(jar, domain, opts.Headers["Cookie"])
+		applyJarCookies(&opts, jar, domain)
+
+		if domain != "" {
+			opts.Headers["Host"] = domain
+		}
+
 		resp, err := DoRequest(rawURL, opts)
 		if err != nil {
 			return nil, err
 		}
-		domain := extractHost(rawURL)
+		resp.FinalURL = rawURL
+
 		if jar != nil {
 			jar.ParseSetCookie(domain, resp.Headers)
 		}
+
 		if resp.Status >= 300 && resp.Status < 400 {
 			loc := resp.Headers.Get("Location")
 			if loc == "" {
 				return resp, nil
 			}
-			if strings.HasPrefix(loc, "/") {
-				u, _ := url.Parse(rawURL)
-				loc = u.Scheme + "://" + u.Host + loc
+
+			base, err := url.Parse(rawURL)
+			if err != nil {
+				return nil, err
 			}
-			rawURL = loc
-			newDomain := extractHost(rawURL)
-			opts.Headers["Host"] = newDomain
-			if jar != nil {
-				cookies := jar.Get(newDomain)
-				if cookies != "" {
-					opts.Headers["Cookie"] = cookies
-				}
+			next, err := url.Parse(loc)
+			if err != nil {
+				return nil, err
 			}
+			rawURL = base.ResolveReference(next).String()
+
+			// Do not overwrite Cookie with jar.Get(newDomain). The next loop iteration
+			// will merge the current Cookie header with jar cookies for the new domain.
 			continue
 		}
+
 		return resp, nil
 	}
 	return nil, fmt.Errorf("too many redirects")
